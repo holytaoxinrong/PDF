@@ -11,6 +11,7 @@ __all__ = [
     "DecisionTreeRegressor",
     "ExtraTreeClassifier",
     "ExtraTreeRegressor",
+    "PowerTreeClassifier"
 ]
 
 import numbers
@@ -39,6 +40,10 @@ from ._splitter import Splitter
 from ._tree import DepthFirstTreeBuilder
 from ._tree import Tree
 from . import _tree, _splitter, _criterion
+
+from hdbscan import HDBSCAN
+from skfeature.function.similarity_based import reliefF
+from sklearn.tree import DecisionTreeClassifier as skDecisionTreeClassifier
 
 
 # =============================================================================
@@ -604,3 +609,143 @@ class ExtraTreeRegressor(DecisionTreeRegressor):
             min_impurity_split=min_impurity_split,
             random_state=random_state,
         )
+
+
+class PowerTreeClassifier(ClassifierMixin, BaseEstimator):
+    """A powerful version of deepforest"""
+    @_deprecate_positional_args
+    def __init__(
+            self,
+            *,
+            criterion="gini",
+            splitter="best",
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            min_weight_fraction_leaf=0.0,
+            max_features=None,
+            random_state=None,
+            min_impurity_decrease=0.0,
+            min_impurity_split=None,
+            class_weight=None,
+    ):
+        self.criterion = criterion
+        self.splitter = splitter
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.min_weight_fraction_leaf = min_weight_fraction_leaf
+        self.max_features = max_features
+        self.class_weight = class_weight
+        self.random_state = random_state
+        self.min_impurity_decrease = min_impurity_decrease
+        self.min_impurity_split = min_impurity_split
+        self.layers = 0
+        self.models_dict = {}
+        self.route_dict = {}
+        self.model_id = 0
+
+    def fit(self, Xs, ys):
+        # get feature scores for all tree leaves
+        length = len(Xs)
+        scoress = []  # store the score of each leaf node in each tree
+        each_tree_leaves_X = []  # store the samples of each leaves in each tree
+        each_tree_leaves_y = []  # store the label of each sample in each leaves in each tree
+        each_tree_leaves = []  # store the index of each leaves that is combined in each tree
+        current_model_ids = []  # store the model id in current layer
+        for i in range(length):
+            # the training process of single tree
+            X = Xs[i]
+            y = ys[i]
+            # go to the next loop, if there is only one class
+            if len(y) == 1:
+                continue
+            dtc = skDecisionTreeClassifier(min_samples_split=self.min_samples_split)
+            dtc.fit(X, y)
+            # go to the training process of next tree if the depth of current tree is 0
+            if dtc.get_depth() == 0:
+                continue
+            self.models_dict[self.model_id] = dtc
+            current_model_ids.append(self.model_id)
+            self.model_id += 1
+            # sktree.plot_tree(dtc)
+            # plt.show()
+            samples_information = dtc.apply(X)
+            unique_leaves_ids = np.unique(samples_information)  # get the leaves of single tree
+            scores = []  # store the feature score of each leaves of current tree
+            current_tree_leaves = []  # store the index of leaves that are combined of current tree
+            for j in range(len(unique_leaves_ids)):
+                current_leaves_samples_idxs = list(np.where(samples_information == unique_leaves_ids[j])[0].astype(int))
+                current_leaves_X = X[current_leaves_samples_idxs]
+                current_leaves_y = y[current_leaves_samples_idxs]
+                # if there is only one class in the current leaf, it does not participate in the clustering process
+                if len(np.unique(current_leaves_y)) == 1:
+                    continue
+                each_tree_leaves_X.append(current_leaves_X)
+                each_tree_leaves_y.append(current_leaves_y)
+                current_tree_leaves.append(unique_leaves_ids[j])
+                score = reliefF.reliefF(current_leaves_X, current_leaves_y)
+                scores.append(score)
+            # go to the next loop, if there is no leaves meet the fusion condition
+            each_tree_leaves.append(current_tree_leaves)
+            if not scores:
+                continue
+            scoress.append(scores)
+        # If there are no leaves that can be fused, exit the iteration process
+        if not scoress:
+            for i in range(len(current_model_ids)):
+                self.route_dict[current_model_ids[i]] = {}
+            return
+        # flatten all leaf feature fractions
+        scoress_1D = []
+        for i in range(len(scoress)):
+            scoress_1D.extend(scoress[i])
+        # if only one leaf is left, it is directly regarded as the result of clustering
+        clusters = None
+        if len(scoress_1D) == 1:
+            clusters = [0]
+        else:
+            # clustering the all leaves of each tree
+            cluster = HDBSCAN(min_cluster_size=2)
+            clusters = cluster.fit_predict(scoress_1D)
+        # get the training data for next loop
+        unique_clusters = np.unique(clusters)
+        next_Xs = []
+        next_ys = []
+        for i in range(len(unique_clusters)):
+            idxs = list(np.where(clusters == unique_clusters[i])[0].astype(int))
+            current_next_X = []
+            current_next_y = []
+            for idx in idxs:
+                current_next_X.extend(each_tree_leaves_X[idx])
+                current_next_y.extend(each_tree_leaves_y[idx])
+            next_Xs.append(np.array(current_next_X))
+            next_ys.append(np.array(current_next_y))
+        # recording the classification path
+        cluster_id = 0
+        for i in range(len(current_model_ids)):
+            current_model_id = current_model_ids[i]
+            self.route_dict[current_model_id] = {}
+            current_tree_leaves = each_tree_leaves[i]
+            for j in range(len(current_tree_leaves)):
+                for k in range(len(unique_clusters)):
+                    if clusters[cluster_id] == unique_clusters[k]:
+                        self.route_dict[current_model_id][current_tree_leaves[j]] = self.model_id + k
+                cluster_id += 1
+        self.fit(next_Xs, next_ys)
+
+    def predict(self, X):
+        predict_y = []
+        for i in range(len(X)):
+            current_sample = X[i]
+            current_model_id = 0
+            while True:
+                current_model = self.models_dict[current_model_id]
+                current_leaves = list(self.route_dict[current_model_id].keys())
+                current_leaf = current_model.apply([current_sample])[0]
+                if current_leaf not in current_leaves:
+                    predict_y.extend(current_model.predict([current_sample]))
+                    break
+                else:
+                    current_model_id = self.route_dict[current_model_id][current_leaf]
+        return predict_y

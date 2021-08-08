@@ -3,6 +3,7 @@ from .tree import DecisionTreeClassifier
 from .tree import DecisionTreeRegressor
 from .tree import ExtraTreeClassifier
 from .tree import ExtraTreeRegressor
+from .tree import PowerTreeClassifier
 
 __all__ = [
     "BaseDecisionTree",
@@ -10,4 +11,5 @@ __all__ = [
     "DecisionTreeRegressor",
     "ExtraTreeClassifier",
     "ExtraTreeRegressor",
+    "PowerTreeClassifier"
 ]
